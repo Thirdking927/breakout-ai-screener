@@ -5,7 +5,7 @@ import yfinance as yf
 
 st.set_page_config(page_title="Breakout AI", layout="centered")
 st.title("🚀 Breakout AI")
-st.caption("Any ticker. Live data via yfinance. Breakout Score (0–100) with full factor breakdown, using z-scores vs the stock’s own history + market regime + confluence bonus.")
+st.caption("Any ticker. Live data via yfinance. Breakout Score (0–100) with full factor breakdown. Smart aggregation so real setups actually surface.")
 
 # ========== Helpers ==========
 def to_series_1d(x, index=None) -> pd.Series:
@@ -48,22 +48,24 @@ def last_float(x) -> float:
         return float("nan")
 
 def zscore_to_score(current: float, hist: pd.Series, cap_sigma: float = 2.0) -> tuple[int, float]:
-    """
-    Convert current value to a 0-100 score using z-score vs hist:
-    score = clip(50 + 25*z, 0, 100), with z capped to +/- cap_sigma for stability.
-    Returns (score, z).
-    """
+    """Map z-score to 0..100 via 50 + 25*z (clipped). Return (score, z)."""
     h = to_series_1d(hist).dropna()
     if not np.isfinite(current) or h.empty: 
-        return 0, float("nan")
-    mu = float(h.mean())
-    sd = float(h.std(ddof=0))
-    if sd == 0:
-        return 50, 0.0
+        return 55, float("nan")  # neutral if missing
+    mu = float(h.mean()); sd = float(h.std(ddof=0))
+    if sd == 0: return 55, 0.0
     z = (current - mu) / sd
     z = max(-cap_sigma, min(cap_sigma, z))
     score = int(round(max(0.0, min(100.0, 50 + 25*z))))
     return score, z
+
+def softmax(scores, tau=12.0):
+    """Softmax weights to emphasize stronger subscores (tau controls sharpness)."""
+    s = np.array(scores, dtype=float)
+    # center around 70 so >=70 gets a boost; <70 reduces weight, but not to zero
+    exps = np.exp((s - 70.0) / max(1e-6, tau))
+    w = exps / np.sum(exps) if np.sum(exps) > 0 else np.ones_like(s)/len(s)
+    return w
 
 # ========== Data fetch (cached) ==========
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -85,11 +87,10 @@ def fetch_fundamentals(ticker: str):
 
 def compute_features(ticker: str):
     close, vol = fetch_prices(ticker)
-    N = min(len(close), 252)  # ~1y window for calibration
+    N = min(len(close), 252)  # ~1y calibration
     c_hist = close.tail(N)
     v_hist = vol.tail(N)
 
-    # --- Technicals (raw)
     price = last_float(close)
     sma200_series = close.rolling(200).mean() if len(close) >= 200 else close.rolling(min(len(close), 50)).mean()
     sma200 = last_float(sma200_series)
@@ -107,14 +108,14 @@ def compute_features(ticker: str):
     mom_1m = pct_change(close, 21)
     mom_3m = pct_change(close, 63)
 
-    # --- Hist series for z-score scaling
+    # Hist for z‑scores
     pct_to_200_hist = ((c_hist / (c_hist.rolling(200).mean())) - 1.0) * 100.0 if len(c_hist) >= 200 else ((c_hist / (c_hist.rolling(50).mean())) - 1.0) * 100.0
     rsi_hist = rsi_series.tail(N)
     volspike_hist = (v_hist / v_hist.rolling(30).mean())
     mom1_hist = c_hist.pct_change(21) * 100.0
     mom3_hist = c_hist.pct_change(63) * 100.0
 
-    # --- Fundamentals (light) ---
+    # Fundamentals (light)
     q_earn, q_fin = fetch_fundamentals(ticker)
     earnings_mom = float("nan"); rev_accel = float("nan"); gm_exp = float("nan")
     try:
@@ -140,11 +141,10 @@ def compute_features(ticker: str):
                 gm_exp = float(gm.iloc[0] - gm.iloc[1])
     except Exception: pass
 
-    # --- Relative strength vs SPY (3m) + its history for z-score ---
+    # Relative strength vs SPY (3m) and its history
     spy_close, _ = fetch_prices("SPY")
     rs_3m = float("nan"); rs_3m_hist = pd.Series(dtype=float)
     try:
-        # Build rolling RS time series over the same index as c_hist
         spy_aligned = spy_close.reindex(close.index).ffill()
         rs_series = (close.pct_change(63) - spy_aligned.pct_change(63)) * 100.0
         rs_3m = last_float(rs_series)
@@ -152,15 +152,12 @@ def compute_features(ticker: str):
     except Exception: pass
 
     return dict(
-        # raw
         price=price, sma200=sma200, pct_to_200=pct_to_200,
         rsi14=rsi14, macd_bull=macd_bull, vol_spike=vol_spike,
         mom_1m=mom_1m, mom_3m=mom_3m, rs_3m=rs_3m,
-        # history for z
         pct_to_200_hist=pct_to_200_hist, rsi_hist=rsi_hist,
         volspike_hist=volspike_hist, mom1_hist=mom1_hist, mom3_hist=mom3_hist,
         rs_3m_hist=rs_3m_hist,
-        # fundamentals
         earnings_mom=earnings_mom, rev_accel=rev_accel, gross_margin_exp=gm_exp
     )
 
@@ -180,55 +177,68 @@ def market_regime_bonus():
     bonus = (5 if bull else 0) + (3 if calm else 0)
     return bonus, {"SPY>200DMA": bull, "VIX<20": calm}
 
-# ========== Weights: Tech 80 / Fund 20 ==========
-W_FUND = {"earnings_mom": 10, "rev_accel": 5, "gross_margin_exp": 5}  # total 20
-W_TECH = {
-    "rel_strength_3m": 20,
-    "pct_to_200_z": 20,
-    "vol_spike_z": 15,
-    "rsi_z": 15,
-    "momentum_z": 10
-}  # total 80
+# ========== Weights (Tech 80 / Fund 20) ==========
+W_FUND = {"earnings_mom": 10, "rev_accel": 5, "gross_margin_exp": 5}
+W_TECH = {"rel_strength_3m": 20, "pct_to_200_z": 20, "vol_spike_z": 15, "rsi_z": 15, "momentum_z": 10}
+
+# ========== Scoring with softmax + floors ==========
+TECH_FLOOR = 45   # low subscores are floored here so one factor can’t tank the stock
+FUND_FLOOR = 45
+NEUTRAL_IF_MISSING = 55
+SOFTMAX_TAU = 12.0
 
 def score_blocks(f):
     rows_f, rows_t = [], []
 
-    # ---- Technicals via z-score vs own 1y history ----
-    s_pct200, z_pct200 = zscore_to_score(f["pct_to_200"], f["pct_to_200_hist"])
+    # Technicals (z-scores vs history)
+    s_pct200, z_pct200 = zscore_to_score(f["pct_to_200"], f["pct_to_200_hist"]); s_pct200 = max(TECH_FLOOR, s_pct200)
     rows_t.append(("Pct vs 200‑DMA (z)", f"{f['pct_to_200']:.1f}%", s_pct200, W_TECH["pct_to_200_z"], f"z={z_pct200:.2f}σ vs 1y"))
 
-    s_rsi, z_rsi = zscore_to_score(f["rsi14"], f["rsi_hist"])
+    s_rsi, z_rsi = zscore_to_score(f["rsi14"], f["rsi_hist"]); s_rsi = max(TECH_FLOOR, s_rsi)
     rows_t.append(("RSI(14) (z)", f"{f['rsi14']:.1f}", s_rsi, W_TECH["rsi_z"], f"z={z_rsi:.2f}σ vs 1y"))
 
-    s_vol, z_vol = zscore_to_score(f["vol_spike"], f["volspike_hist"])
+    s_vol, z_vol = zscore_to_score(f["vol_spike"], f["volspike_hist"]); s_vol = max(TECH_FLOOR, s_vol)
     rows_t.append(("Volume/30d (z)", f"{f['vol_spike']:.2f}×", s_vol, W_TECH["vol_spike_z"], f"z={z_vol:.2f}σ vs 1y"))
 
-    s_m1, z_m1 = zscore_to_score(f["mom_1m"], f["mom1_hist"])
-    s_m3, z_m3 = zscore_to_score(f["mom_3m"], f["mom3_hist"])
-    s_mom = int(round((s_m1 + s_m3) / 2))
+    s_m1, z_m1 = zscore_to_score(f["mom_1m"], f["mom1_hist"]); s_m3, z_m3 = zscore_to_score(f["mom_3m"], f["mom3_hist"])
+    s_mom = int(round((max(TECH_FLOOR, s_m1) + max(TECH_FLOOR, s_m3)) / 2))
     rows_t.append(("Momentum (1m & 3m z)", f"1m={f['mom_1m']:.1f}%, 3m={f['mom_3m']:.1f}%", s_mom, W_TECH["momentum_z"], f"z1m={z_m1:.2f}, z3m={z_m3:.2f}"))
 
-    s_rs, z_rs = zscore_to_score(f["rs_3m"], f["rs_3m_hist"])
+    s_rs, z_rs = zscore_to_score(f["rs_3m"], f["rs_3m_hist"]); s_rs = max(TECH_FLOOR, s_rs)
     rows_t.append(("Relative Strength vs SPY (3m z)", f"{f['rs_3m']:.1f}%", s_rs, W_TECH["rel_strength_3m"], f"z={z_rs:.2f}σ vs 1y"))
 
-    # ---- Fundamentals (light, min-max style mapping kept) ----
-    def map_minmax(v, lo, hi):
-        if not np.isfinite(v): return 0
+    # Fundamentals (min‑max mapping, floored)
+    def map_minmax(v, lo, hi, floor=FUND_FLOOR):
+        if not np.isfinite(v): return NEUTRAL_IF_MISSING
         x = (v - lo) / (hi - lo)
-        return int(round(100 * max(0, min(1, x))))
+        raw = int(round(100 * max(0, min(1, x))))
+        return max(floor, raw)
+
     em = f.get("earnings_mom", float("nan"))
     s_em = map_minmax(em, -20, 50)
-    rows_f.append(("Earnings Momentum (YoY revenue)", em if np.isfinite(em) else "N/A", s_em, W_FUND["earnings_mom"], "−20…+50% mapped"))
+    rows_f.append(("Earnings Momentum (YoY revenue)", em if np.isfinite(em) else "N/A", s_em, W_FUND["earnings_mom"], "−20…+50% mapped (floor applied)"))
 
     ra = f.get("rev_accel", float("nan"))
     s_ra = map_minmax(ra, -15, 25)
-    rows_f.append(("Revenue Acceleration (pp)", ra if np.isfinite(ra) else "N/A", s_ra, W_FUND["rev_accel"], "−15…+25 pp mapped"))
+    rows_f.append(("Revenue Acceleration (pp)", ra if np.isfinite(ra) else "N/A", s_ra, W_FUND["rev_accel"], "−15…+25 pp mapped (floor)"))
 
     gm = f.get("gross_margin_exp", float("nan"))
     s_gm = map_minmax(gm, -8, 15)
-    rows_f.append(("Gross Margin Expansion (pp)", gm if np.isfinite(gm) else "N/A", s_gm, W_FUND["gross_margin_exp"], "−8…+15 pp mapped"))
+    rows_f.append(("Gross Margin Expansion (pp)", gm if np.isfinite(gm) else "N/A", s_gm, W_FUND["gross_margin_exp"], "−8…+15 pp mapped (floor)"))
 
     return rows_f, rows_t
+
+def softmax_aggregate(rows, section_weights, tau=SOFTMAX_TAU):
+    """Softmax-average subscores within a section using the section's factor weights."""
+    # expand factor subscores by weight (so higher-weight signals count more)
+    expanded = []
+    for _, _, s, w, _ in rows:
+        expanded.extend([s] * max(1, int(w)))  # repeat by weight
+    scores = np.array(expanded, dtype=float)
+    if len(scores) == 0:
+        return 0
+    w = softmax(scores, tau=tau)
+    return int(round(np.sum(scores * w)))
 
 def weighted_score(rows):
     tw = sum(w for *_ , w, _ in rows)
@@ -247,7 +257,14 @@ if st.button("Run Screener"):
             feats = compute_features(ticker)
             fund_rows, tech_rows = score_blocks(feats)
 
-            base = weighted_score(fund_rows + tech_rows)
+            # Softmax aggregate inside technicals to emphasize winners
+            tech_soft = softmax_aggregate(tech_rows, W_TECH, tau=SOFTMAX_TAU)
+            # Fundamentals: straight weighted average (lighter impact, but floored subscores)
+            fund_avg = weighted_score(fund_rows)
+
+            # Combine: 80% tech / 20% fund using section aggregates
+            base = int(round(0.80 * tech_soft + 0.20 * fund_avg))
+
             conf_bonus, hits = confluence_bonus(tech_rows, threshold=70, need=3, bonus=5)
             mr_bonus, regime_flags = market_regime_bonus()
             final_score = int(min(100, max(0, base + conf_bonus + mr_bonus)))
@@ -263,8 +280,10 @@ if st.button("Run Screener"):
         st.markdown("### Fundamentals Breakdown")
         st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note} for (n,v,s,w,note) in fund_rows]), use_container_width=True)
 
-        st.markdown("### Bonuses")
+        st.markdown("### Bonuses & Aggregation")
         st.json({
+            "Technical softmax aggregate (0–100)": tech_soft,
+            "Fundamentals weighted avg (0–100)": fund_avg,
             "Confluence bonus": f"+{conf_bonus} (tech factors ≥70: {hits})",
             "Market regime bonus": f"+{mr_bonus}",
             **regime_flags
@@ -275,7 +294,7 @@ if st.button("Run Screener"):
                      for k,v in feats.items() 
                      if k not in ["pct_to_200_hist","rsi_hist","volspike_hist","mom1_hist","mom3_hist","rs_3m_hist"]})
 
-        st.caption("Technical subscores use z-scores vs the stock’s own ~1y history. Confluence and market regime bonuses help strong setups actually surface as green.")
+        st.caption("Smart aggregation: floors prevent one weak factor from nuking the score; softmax favors strong signals; missing data is neutral.")
 
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
