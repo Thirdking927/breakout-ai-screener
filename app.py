@@ -5,7 +5,7 @@ import yfinance as yf
 
 st.set_page_config(page_title="Breakout AI", layout="centered")
 st.title("🚀 Breakout AI")
-st.caption("Any ticker. Live data via yfinance. Breakout Score (0–100) with full factor breakdown, calibrated by the stock’s own history + market regime.")
+st.caption("Any ticker. Live data via yfinance. Breakout Score (0–100) with full factor breakdown, using z-scores vs the stock’s own history + market regime + confluence bonus.")
 
 # ========== Helpers ==========
 def to_series_1d(x, index=None) -> pd.Series:
@@ -47,11 +47,23 @@ def last_float(x) -> float:
     except Exception:
         return float("nan")
 
-def percentile_score(current: float, hist: pd.Series) -> int:
-    """Percentile (0-100) of current vs. historical series (dropna)."""
+def zscore_to_score(current: float, hist: pd.Series, cap_sigma: float = 2.0) -> tuple[int, float]:
+    """
+    Convert current value to a 0-100 score using z-score vs hist:
+    score = clip(50 + 25*z, 0, 100), with z capped to +/- cap_sigma for stability.
+    Returns (score, z).
+    """
     h = to_series_1d(hist).dropna()
-    if not np.isfinite(current) or h.empty: return 0
-    return int(round(100 * (h <= current).mean()))
+    if not np.isfinite(current) or h.empty: 
+        return 0, float("nan")
+    mu = float(h.mean())
+    sd = float(h.std(ddof=0))
+    if sd == 0:
+        return 50, 0.0
+    z = (current - mu) / sd
+    z = max(-cap_sigma, min(cap_sigma, z))
+    score = int(round(max(0.0, min(100.0, 50 + 25*z))))
+    return score, z
 
 # ========== Data fetch (cached) ==========
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -73,12 +85,11 @@ def fetch_fundamentals(ticker: str):
 
 def compute_features(ticker: str):
     close, vol = fetch_prices(ticker)
-    # history window for percentile calibration
-    N = min(len(close), 252)  # ~1y trading days
+    N = min(len(close), 252)  # ~1y window for calibration
     c_hist = close.tail(N)
     v_hist = vol.tail(N)
 
-    # Technicals (raw)
+    # --- Technicals (raw)
     price = last_float(close)
     sma200_series = close.rolling(200).mean() if len(close) >= 200 else close.rolling(min(len(close), 50)).mean()
     sma200 = last_float(sma200_series)
@@ -96,14 +107,14 @@ def compute_features(ticker: str):
     mom_1m = pct_change(close, 21)
     mom_3m = pct_change(close, 63)
 
-    # Hist series for percentiles
+    # --- Hist series for z-score scaling
     pct_to_200_hist = ((c_hist / (c_hist.rolling(200).mean())) - 1.0) * 100.0 if len(c_hist) >= 200 else ((c_hist / (c_hist.rolling(50).mean())) - 1.0) * 100.0
     rsi_hist = rsi_series.tail(N)
     volspike_hist = (v_hist / v_hist.rolling(30).mean())
     mom1_hist = c_hist.pct_change(21) * 100.0
     mom3_hist = c_hist.pct_change(63) * 100.0
 
-    # Fundamentals (best-effort)
+    # --- Fundamentals (light) ---
     q_earn, q_fin = fetch_fundamentals(ticker)
     earnings_mom = float("nan"); rev_accel = float("nan"); gm_exp = float("nan")
     try:
@@ -129,24 +140,29 @@ def compute_features(ticker: str):
                 gm_exp = float(gm.iloc[0] - gm.iloc[1])
     except Exception: pass
 
-    # Relative strength vs SPY (3m)
+    # --- Relative strength vs SPY (3m) + its history for z-score ---
     spy_close, _ = fetch_prices("SPY")
-    rs_3m = float("nan")
+    rs_3m = float("nan"); rs_3m_hist = pd.Series(dtype=float)
     try:
-        if len(close) > 63 and len(spy_close) > 63:
-            rs_3m = pct_change(close, 63) - pct_change(spy_close.reindex(close.index).ffill(), 63)
+        # Build rolling RS time series over the same index as c_hist
+        spy_aligned = spy_close.reindex(close.index).ffill()
+        rs_series = (close.pct_change(63) - spy_aligned.pct_change(63)) * 100.0
+        rs_3m = last_float(rs_series)
+        rs_3m_hist = rs_series.tail(N)
     except Exception: pass
 
-    feats = dict(
+    return dict(
+        # raw
         price=price, sma200=sma200, pct_to_200=pct_to_200,
         rsi14=rsi14, macd_bull=macd_bull, vol_spike=vol_spike,
-        mom_1m=mom_1m, mom_3m=mom_3m,
+        mom_1m=mom_1m, mom_3m=mom_3m, rs_3m=rs_3m,
+        # history for z
         pct_to_200_hist=pct_to_200_hist, rsi_hist=rsi_hist,
         volspike_hist=volspike_hist, mom1_hist=mom1_hist, mom3_hist=mom3_hist,
-        earnings_mom=earnings_mom, rev_accel=rev_accel, gross_margin_exp=gm_exp,
-        rs_3m=rs_3m
+        rs_3m_hist=rs_3m_hist,
+        # fundamentals
+        earnings_mom=earnings_mom, rev_accel=rev_accel, gross_margin_exp=gm_exp
     )
-    return feats
 
 # Market regime (+5 if SPY > 200DMA, +3 if VIX<20)
 @st.cache_data(show_spinner=False, ttl=900)
@@ -168,52 +184,48 @@ def market_regime_bonus():
 W_FUND = {"earnings_mom": 10, "rev_accel": 5, "gross_margin_exp": 5}  # total 20
 W_TECH = {
     "rel_strength_3m": 20,
-    "pct_to_200_pctile": 20,
-    "vol_spike_pctile": 15,
-    "rsi_pctile": 15,
-    "momentum_pctile": 10
-}  # subtotal 80 (plus MACD flag included inside momentum_pctile calc commentary or add as note)
+    "pct_to_200_z": 20,
+    "vol_spike_z": 15,
+    "rsi_z": 15,
+    "momentum_z": 10
+}  # total 80
 
-def score_block(ticker_feats):
-    f = ticker_feats
+def score_blocks(f):
     rows_f, rows_t = [], []
 
-    # ---- Technicals via percentiles (vs own 1y history) ----
-    s_pct200 = percentile_score(f["pct_to_200"], f["pct_to_200_hist"])
-    rows_t.append(("Pct vs 200‑DMA (percentile)", f"{f['pct_to_200']:.1f}%", s_pct200, W_TECH["pct_to_200_pctile"], "Higher vs own 1y baseline"))
+    # ---- Technicals via z-score vs own 1y history ----
+    s_pct200, z_pct200 = zscore_to_score(f["pct_to_200"], f["pct_to_200_hist"])
+    rows_t.append(("Pct vs 200‑DMA (z)", f"{f['pct_to_200']:.1f}%", s_pct200, W_TECH["pct_to_200_z"], f"z={z_pct200:.2f}σ vs 1y"))
 
-    s_rsi = percentile_score(f["rsi14"], f["rsi_hist"])
-    rows_t.append(("RSI(14) (percentile)", f"{f['rsi14']:.1f}", s_rsi, W_TECH["rsi_pctile"], "RSI relative to own history"))
+    s_rsi, z_rsi = zscore_to_score(f["rsi14"], f["rsi_hist"])
+    rows_t.append(("RSI(14) (z)", f"{f['rsi14']:.1f}", s_rsi, W_TECH["rsi_z"], f"z={z_rsi:.2f}σ vs 1y"))
 
-    s_vol = percentile_score(f["vol_spike"], f["volspike_hist"])
-    rows_t.append(("Volume/30d (percentile)", f"{f['vol_spike']:.2f}×", s_vol, W_TECH["vol_spike_pctile"], "Volume expansion vs own history"))
+    s_vol, z_vol = zscore_to_score(f["vol_spike"], f["volspike_hist"])
+    rows_t.append(("Volume/30d (z)", f"{f['vol_spike']:.2f}×", s_vol, W_TECH["vol_spike_z"], f"z={z_vol:.2f}σ vs 1y"))
 
-    s_m1 = percentile_score(f["mom_1m"], f["mom1_hist"])
-    s_m3 = percentile_score(f["mom_3m"], f["mom3_hist"])
+    s_m1, z_m1 = zscore_to_score(f["mom_1m"], f["mom1_hist"])
+    s_m3, z_m3 = zscore_to_score(f["mom_3m"], f["mom3_hist"])
     s_mom = int(round((s_m1 + s_m3) / 2))
-    rows_t.append(("Momentum (1m & 3m percentiles)", f"1m={f['mom_1m']:.1f}%, 3m={f['mom_3m']:.1f}%", s_mom, W_TECH["momentum_pctile"], "Averaged percentiles"))
+    rows_t.append(("Momentum (1m & 3m z)", f"1m={f['mom_1m']:.1f}%, 3m={f['mom_3m']:.1f}%", s_mom, W_TECH["momentum_z"], f"z1m={z_m1:.2f}, z3m={z_m3:.2f}"))
 
-    # Relative strength vs SPY (3m)
-    rs_val = f["rs_3m"]
-    # map RS (−20…+20%) to 0–100 using simple min‑max ▸ still percentile‑ish
-    def minmax(v, lo=-20, hi=20):
+    s_rs, z_rs = zscore_to_score(f["rs_3m"], f["rs_3m_hist"])
+    rows_t.append(("Relative Strength vs SPY (3m z)", f"{f['rs_3m']:.1f}%", s_rs, W_TECH["rel_strength_3m"], f"z={z_rs:.2f}σ vs 1y"))
+
+    # ---- Fundamentals (light, min-max style mapping kept) ----
+    def map_minmax(v, lo, hi):
         if not np.isfinite(v): return 0
         x = (v - lo) / (hi - lo)
         return int(round(100 * max(0, min(1, x))))
-    s_rs = minmax(rs_val, -20, 20)
-    rows_t.append(("Relative Strength vs SPY (3m)", f"{rs_val:.1f}%", s_rs, W_TECH["rel_strength_3m"], "Outperform market last 3m"))
-
-    # ---- Fundamentals (lighter) ----
     em = f.get("earnings_mom", float("nan"))
-    s_em = minmax(em, -20, 50)
+    s_em = map_minmax(em, -20, 50)
     rows_f.append(("Earnings Momentum (YoY revenue)", em if np.isfinite(em) else "N/A", s_em, W_FUND["earnings_mom"], "−20…+50% mapped"))
 
     ra = f.get("rev_accel", float("nan"))
-    s_ra = minmax(ra, -15, 25)
+    s_ra = map_minmax(ra, -15, 25)
     rows_f.append(("Revenue Acceleration (pp)", ra if np.isfinite(ra) else "N/A", s_ra, W_FUND["rev_accel"], "−15…+25 pp mapped"))
 
     gm = f.get("gross_margin_exp", float("nan"))
-    s_gm = minmax(gm, -8, 15)
+    s_gm = map_minmax(gm, -8, 15)
     rows_f.append(("Gross Margin Expansion (pp)", gm if np.isfinite(gm) else "N/A", s_gm, W_FUND["gross_margin_exp"], "−8…+15 pp mapped"))
 
     return rows_f, rows_t
@@ -223,17 +235,22 @@ def weighted_score(rows):
     if tw <= 0: return 0
     return int(round(sum(s * w for *_, s, w, _ in rows) / tw))
 
+def confluence_bonus(tech_rows, threshold=70, need=3, bonus=5):
+    hits = sum(1 for (_, _, s, _, _) in tech_rows if s >= threshold)
+    return bonus if hits >= need else 0, hits
+
 # ========== UI ==========
 ticker = st.text_input("Ticker", value="ASTS").strip().upper()
 if st.button("Run Screener"):
     try:
         with st.spinner("Fetching & scoring…"):
             feats = compute_features(ticker)
-            fund_rows, tech_rows = score_block(feats)
-            raw_score = weighted_score(fund_rows + tech_rows)
+            fund_rows, tech_rows = score_blocks(feats)
 
-            bonus, regime_flags = market_regime_bonus()
-            final_score = int(min(100, max(0, raw_score + bonus)))
+            base = weighted_score(fund_rows + tech_rows)
+            conf_bonus, hits = confluence_bonus(tech_rows, threshold=70, need=3, bonus=5)
+            mr_bonus, regime_flags = market_regime_bonus()
+            final_score = int(min(100, max(0, base + conf_bonus + mr_bonus)))
 
         st.subheader(f"Result for {ticker}")
         st.metric("Breakout Score (0–100)", final_score)
@@ -246,13 +263,19 @@ if st.button("Run Screener"):
         st.markdown("### Fundamentals Breakdown")
         st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note} for (n,v,s,w,note) in fund_rows]), use_container_width=True)
 
-        st.markdown("### Market Regime")
-        st.json({"Bonus": f"+{bonus} pts", **regime_flags})
+        st.markdown("### Bonuses")
+        st.json({
+            "Confluence bonus": f"+{conf_bonus} (tech factors ≥70: {hits})",
+            "Market regime bonus": f"+{mr_bonus}",
+            **regime_flags
+        })
 
         with st.expander("Debug / raw features"):
-            st.json({k:(float(v) if isinstance(v,(int,float,np.floating)) else (None if v is None else str(v)) ) for k,v in feats.items() if k not in ["pct_to_200_hist","rsi_hist","volspike_hist","mom1_hist","mom3_hist"]})
+            st.json({k:(float(v) if isinstance(v,(int,float,np.floating)) else (None if v is None else str(v)) ) 
+                     for k,v in feats.items() 
+                     if k not in ["pct_to_200_hist","rsi_hist","volspike_hist","mom1_hist","mom3_hist","rs_3m_hist"]})
 
-        st.caption("Notes: Factors are percentiled vs the stock’s own last ~252 trading days and adjusted for market regime. Fundamentals lighter by design so strong technicals can surface.")
+        st.caption("Technical subscores use z-scores vs the stock’s own ~1y history. Confluence and market regime bonuses help strong setups actually surface as green.")
 
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
