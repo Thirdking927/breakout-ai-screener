@@ -5,7 +5,7 @@ import yfinance as yf
 
 st.set_page_config(page_title="Breakout AI", layout="centered")
 st.title("🚀 Breakout AI")
-st.caption("Switch between Breakout (trader) and Growth (fundamental) modes. Any ticker. Live data via yfinance.")
+st.caption("Three modes: Pre‑Breakout (predictive), Breakout (trader), Growth (fundamental). Any ticker. Live data via yfinance.")
 
 # ----------------- helpers -----------------
 def to_series_1d(x, index=None) -> pd.Series:
@@ -56,7 +56,7 @@ def zscore_to_score(current: float, hist: pd.Series, cap_sigma: float = 2.0):
 
 def softmax(scores, tau=8.0):
     s = np.array(scores, dtype=float)
-    exps = np.exp((s - 70.0)/max(tau,1e-6))  # anchor around 70 so strong signals pop
+    exps = np.exp((s - 70.0)/max(tau,1e-6))  # anchor around 70
     w = exps/np.sum(exps) if np.sum(exps)>0 else np.ones_like(s)/len(s)
     return w
 
@@ -126,7 +126,9 @@ def compute_features(ticker: str):
     mom3_hist = c_hist.pct_change(63)*100.0
 
     # fundamentals (for Growth mode)
-    q_earn, q_fin = fetch_fundamentals(ticker)
+    tkr = yf.Ticker(ticker)
+    q_earn = tkr.quarterly_earnings if isinstance(tkr.quarterly_earnings,pd.DataFrame) else pd.DataFrame()
+    q_fin  = tkr.quarterly_financials if isinstance(tkr.quarterly_financials,pd.DataFrame) else pd.DataFrame()
     earnings_mom = rev_accel = gm_exp = float("nan")
     try:
         if not q_earn.empty and "Revenue" in q_earn.columns:
@@ -156,21 +158,22 @@ def compute_features(ticker: str):
         rs_3m = last_float(rs_series); rs_3m_hist = rs_series.tail(N)
     except Exception: pass
 
+    # also return raw series for predictive mode
     return dict(
         price=price, sma200=sma200, pct_to_200=pct_to_200,
         rsi14=rsi14, macd_bull=macd_bull, vol_spike=vol_spike,
         mom_1m=mom_1m, mom_3m=mom_3m, rs_3m=rs_3m,
         pct_to_200_hist=pct_to_200_hist, rsi_hist=rsi_hist, volspike_hist=volspike_hist,
         mom1_hist=mom1_hist, mom3_hist=mom3_hist, rs_3m_hist=rs_3m_hist,
-        earnings_mom=earnings_mom, rev_accel=rev_accel, gross_margin_exp=gm_exp
+        earnings_mom=earnings_mom, rev_accel=rev_accel, gross_margin_exp=gm_exp,
+        _close=close, _vol=vol, _spy=spy_close
     )
 
-# ----------------- scoring blocks -----------------
+# ----------------- scoring: BREAKOUT & GROWTH -----------------
 def breakout_scoring(f):
-    """Pure breakout: technicals only, strict downtrend penalties."""
-    TECH_FLOOR = 45  # floor weak subscores so one lagging factor can't nuke it
+    """Pure breakout: technicals only, confluence + downtrend penalties."""
+    TECH_FLOOR = 45
 
-    # z‑scores → subscores
     s_pct200, z_pct200 = zscore_to_score(f["pct_to_200"], f["pct_to_200_hist"]); s_pct200=max(TECH_FLOOR,s_pct200)
     s_rsi,   z_rsi    = zscore_to_score(f["rsi14"],      f["rsi_hist"]);         s_rsi=max(TECH_FLOOR,s_rsi)
     s_vol,   z_vol    = zscore_to_score(f["vol_spike"],  f["volspike_hist"]);    s_vol=max(TECH_FLOOR,s_vol)
@@ -187,28 +190,20 @@ def breakout_scoring(f):
         ("Momentum (1m & 3m z)",   f"1m={f['mom_1m']:.1f}%, 3m={f['mom_3m']:.1f}%", s_mom, 10, "avg of z‑scores"),
     ]
 
-    # Confluence (≥2 strong techs lights it up)
     conf_hits = sum(1 for (_,_,s,_,_) in tech_rows if s>=70)
     conf_bonus = 15 if conf_hits >= 2 else 0
 
-    # Downtrend penalties so weak names can't go green
     penalties = 0
-    # below 200DMA → −20
     if np.isfinite(f["pct_to_200"]) and f["pct_to_200"] < 0: penalties -= 20
-    # negative 3m RS → −10
     if np.isfinite(f["rs_3m"]) and f["rs_3m"] < 0: penalties -= 10
-    # negative 1m momentum → −10
     if np.isfinite(f["mom_1m"]) and f["mom_1m"] < 0: penalties -= 10
 
-    # Aggregate technicals (purely) via softmax
     tech_soft = softmax_aggregate(tech_rows, tau=6.0)
     base = int(round(tech_soft + penalties))
-
     return [], tech_rows, 0, tech_soft, conf_bonus, conf_hits, penalties
 
 def growth_scoring(f):
     """Growth/fundamental mode: fundamentals heavy, technicals capped."""
-    # Technicals (z-scores)
     s_pct200,_ = zscore_to_score(f["pct_to_200"], f["pct_to_200_hist"])
     s_rsi,_    = zscore_to_score(f["rsi14"],      f["rsi_hist"])
     s_vol,_    = zscore_to_score(f["vol_spike"],  f["volspike_hist"])
@@ -224,9 +219,8 @@ def growth_scoring(f):
         ("Rel.Str. vs SPY (3m z)", f"{f['rs_3m']:.1f}%",  s_rs,     10, ""),
         ("Momentum (1m & 3m z)",   f"1m={f['mom_1m']:.1f}%, 3m={f['mom_3m']:.1f}%", s_mom, 10, ""),
     ]
-    tech_soft = min(70, softmax_aggregate(tech_rows, tau=10.0))  # cap tech influence in Growth
+    tech_soft = min(70, softmax_aggregate(tech_rows, tau=10.0))
 
-    # Fundamentals (min‑max)
     s_em = minmax_score(f.get("earnings_mom",np.nan), -20, 50)
     s_ra = minmax_score(f.get("rev_accel",np.nan),     -15, 25)
     s_gm = minmax_score(f.get("gross_margin_exp",np.nan), -8, 15)
@@ -235,65 +229,168 @@ def growth_scoring(f):
         ("Revenue Acceleration (pp)",       f.get("rev_accel","N/A"),     s_ra,  5, "−15…+25 pp"),
         ("Gross Margin Expansion (pp)",     f.get("gross_margin_exp","N/A"), s_gm, 5, "−8…+15 pp"),
     ]
-    # Weighted avg fundamentals (heavier)
     fw = sum(w for *_ , w, _ in fund_rows)
     fund_avg = int(round(sum(s*w for (_,_,s,w,_) in fund_rows)/fw)) if fw>0 else 0
 
-    # Heavy weight to fundamentals
     base = int(round(0.70 * fund_avg + 0.30 * tech_soft))
     return fund_rows, tech_rows, fund_avg, tech_soft, 0, 0, 0
 
+# ----------------- NEW: Pre‑Breakout (predictive) -----------------
+def prebreakout_scoring(ticker: str, f: dict):
+    """
+    Predictive: score setup quality BEFORE the pop.
+    Signals:
+      - Tight base / volatility contraction (20d volatility percentile low)
+      - Bollinger band width (20d) percentile low
+      - Volume dry‑up (10d/50d)
+      - Proximity to pivot (≤3% below recent base high)
+      - RS line leading SPY (RS near 1y high while price still below pivot)
+      - OBV slope positive (20d)
+    """
+    close = f["_close"]; vol = f["_vol"]; spy = f["_spy"]
+    N = min(len(close), 252)
+    ch = close.tail(N); vh = vol.tail(N)
+
+    # 1) Volatility contraction (20d std of returns)
+    ret = ch.pct_change()
+    vol20 = ret.rolling(20).std()*100.0
+    vol20_pctile = int(round(100*(vol20.dropna() <= last_float(vol20)).mean())) if len(vol20.dropna())>0 else 55
+    s_vol_contract = 100 - vol20_pctile  # lower vol = tighter = better
+
+    # 2) Bollinger Band Width (20d)
+    ma20 = ch.rolling(20).mean()
+    std20 = ch.rolling(20).std()
+    bbw = (std20 / ma20).replace([np.inf,-np.inf], np.nan)
+    bbw_pctile = int(round(100*(bbw.dropna() <= last_float(bbw)).mean())) if len(bbw.dropna())>0 else 55
+    s_bbw = 100 - bbw_pctile  # tighter bands better
+
+    # 3) Volume dry‑up (10d vs 50d)
+    v10 = vh.rolling(10).mean(); v50 = vh.rolling(50).mean()
+    vol_dryup_ratio = last_float(v10)/last_float(v50) if last_float(v50)>0 else 1.0
+    s_dryup = minmax_score(1.0 - vol_dryup_ratio, -0.2, 0.4)  # reward <1.0; strong if <=0.6
+
+    # 4) Define base (last ~8 weeks) and pivot
+    base_win = 40  # ~8 weeks
+    base = ch.tail(base_win)
+    if len(base)<10:
+        pivot = last_float(ch.rolling(10).max())
+    else:
+        pivot = float(base.max())
+    last_p = last_float(ch)
+    dist_to_pivot = (pivot - last_p)/pivot*100.0 if pivot>0 else float("nan")
+    # Good if within 0.5%..3% below pivot (not extended; ready)
+    s_pivot_prox = minmax_score(3.0 - dist_to_pivot, -5.0, 3.0) if np.isfinite(dist_to_pivot) else 55
+
+    # 5) RS line (stock/SPY) – is RS near 1y high while price still < pivot?
+    spy_al = spy.reindex(close.index).ffill()
+    rs_line = ch / spy_al.reindex(ch.index).ffill()
+    rs_high_1y = rs_line.rolling(min(252,len(rs_line))).max()
+    rs_at_high = last_float(rs_line) / last_float(rs_high_1y) if last_float(rs_high_1y)>0 else np.nan
+    s_rs_lead = minmax_score(rs_at_high, 0.95, 1.02)  # near/new RS highs get rewarded
+
+    # 6) OBV slope (20d)
+    signed = np.sign(ch.diff().fillna(0.0))
+    obv = (signed * vh).cumsum()
+    obv_slope = (obv.diff(20).iloc[-1]) if len(obv)>=21 else np.nan
+    # scale slope by recent avg volume to be dimensionless
+    norm = last_float(v50)
+    obv_norm = float(obv_slope / norm) if (np.isfinite(obv_slope) and norm>0) else np.nan
+    s_obv = minmax_score(obv_norm, -0.5, 0.5)
+
+    # Composite predictive score (weights sum to 100)
+    pred_rows = [
+        ("Volatility Contraction (20d pctile low)", f"{vol20.iloc[-1]:.2f}% std" if np.isfinite(last_float(vol20)) else "N/A", s_vol_contract, 25, "Tighter = better"),
+        ("Band Width (20d pctile low)", f"{bbw.iloc[-1]:.4f}" if np.isfinite(last_float(bbw)) else "N/A", s_bbw, 20, "Tighter bands = coiled"),
+        ("Volume Dry‑Up (10d/50d)", f"{vol_dryup_ratio:.2f}×", s_dryup, 20, "Lower than 1.0 preferred"),
+        ("Proximity to Pivot", f"{dist_to_pivot:.2f}% below", s_pivot_prox, 20, "0.5–3% below pivot is ideal"),
+        ("RS Line Leading (vs SPY)", f"{rs_at_high:.3f}× of 1y high" if np.isfinite(rs_at_high) else "N/A", s_rs_lead, 10, "Near RS highs pre‑breakout"),
+        ("OBV Slope (20d)", f"{obv_norm:.3f}" if np.isfinite(obv_norm) else "N/A", s_obv, 5, "Accumulation"),
+    ]
+    pred_score = int(round(sum(s*w for (_,_,s,w,_) in pred_rows)/sum(w for *_ , w, _ in pred_rows)))
+
+    # Status tag
+    if np.isfinite(dist_to_pivot) and dist_to_pivot <= 0:
+        status = "Early Breakout (above pivot)"
+    elif np.isfinite(dist_to_pivot) and 0 < dist_to_pivot <= 3.0:
+        status = "Setup (near pivot)"
+    elif np.isfinite(dist_to_pivot) and dist_to_pivot <= 6.0:
+        status = "Watchlist (within 6%)"
+    else:
+        status = "Forming Base / Too Far"
+
+    extra = {
+        "pivot_price": float(pivot) if np.isfinite(pivot) else None,
+        "distance_to_pivot_%": float(dist_to_pivot) if np.isfinite(dist_to_pivot) else None,
+        "rs_near_1y_high_ratio": float(rs_at_high) if np.isfinite(rs_at_high) else None
+    }
+    return pred_rows, pred_score, status, extra
+
 # ----------------- UI -----------------
-mode = st.radio("Mode", ["Breakout (trader)","Growth (fundamental)"], horizontal=True)
+mode = st.radio("Mode", ["Pre‑Breakout (predictive)","Breakout (trader)","Growth (fundamental)"], horizontal=True)
 ticker = st.text_input("Ticker", value="TSLA").strip().upper()
 
 if st.button("Run Screener"):
     try:
         with st.spinner("Fetching & scoring…"):
             feats = compute_features(ticker)
-            if mode.startswith("Breakout"):
+            mr_bonus, regime_flags = market_regime_bonus()
+
+            if mode.startswith("Pre‑Breakout"):
+                pred_rows, pred_score, status, extra = prebreakout_scoring(ticker, feats)
+                final_score = int(min(100, max(0, pred_score + mr_bonus)))
+                st.subheader(f"{mode} — {ticker}")
+                st.metric("Pre‑Breakout Setup Score (0–100)", final_score)
+                if final_score >= 70: st.success(f"✅ {status}")
+                elif final_score >= 50: st.info(f"🟡 {status}")
+                else: st.warning(f"🔴 {status}")
+                st.markdown("### Predictive Breakdown")
+                st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note}
+                                           for (n,v,s,w,note) in pred_rows]), use_container_width=True)
+                st.markdown("### Market / Extras")
+                st.json({"Market bonus": f"+{mr_bonus}", **regime_flags, **extra})
+
+            elif mode.startswith("Breakout"):
                 fund_rows, tech_rows, fund_avg, tech_soft, conf_bonus, conf_hits, penalties = breakout_scoring(feats)
-                mr_bonus, regime_flags = market_regime_bonus()
                 final_score = int(min(100, max(0, tech_soft + conf_bonus + penalties + mr_bonus)))
-            else:
-                fund_rows, tech_rows, fund_avg, tech_soft, conf_bonus, conf_hits, penalties = growth_scoring(feats)
-                mr_bonus, regime_flags = market_regime_bonus()
+                st.subheader(f"{mode} — {ticker}")
+                st.metric("Breakout Score (0–100)", final_score)
+                if final_score >= 70: st.success("🔥 Strong Breakout Setup")
+                elif final_score >= 50: st.info("🟡 Constructive / Watchlist")
+                else: st.warning("🔴 Weak / Avoid")
+                st.markdown("### Technicals Breakdown")
+                st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note}
+                                           for (n,v,s,w,note) in tech_rows]), use_container_width=True)
+                st.markdown("### Bonuses / Penalties")
+                st.json({
+                    "Confluence bonus": f"+{conf_bonus} (tech factors ≥70: {conf_hits})",
+                    "Downtrend penalties": penalties,
+                    "Market regime bonus": f"+{mr_bonus}",
+                    **regime_flags
+                })
+
+            else:  # Growth
+                fund_rows, tech_rows, fund_avg, tech_soft, _, _, _ = growth_scoring(feats)
                 final_score = int(min(100, max(0, int(round(0.70*fund_avg + 0.30*tech_soft)) + mr_bonus)))
-
-        st.subheader(f"{mode} — {ticker}")
-        st.metric("Breakout Score (0–100)", final_score)
-        if final_score >= 70:
-            st.success("🔥 Strong Breakout Setup")
-        elif final_score >= 50:
-            st.info("🟡 Constructive / Watchlist")
-        else:
-            st.warning("🔴 Weak / Avoid")
-
-        st.markdown("### Technicals Breakdown")
-        st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note}
-                                   for (n,v,s,w,note) in tech_rows]), use_container_width=True)
-
-        st.markdown("### Fundamentals Breakdown")
-        if fund_rows:
-            st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note}
-                                       for (n,v,s,w,note) in fund_rows]), use_container_width=True)
-        else:
-            st.write("_(Not used in Breakout mode)_")
-
-        st.markdown("### Bonuses / Penalties")
-        st.json({
-            "Confluence bonus (Breakout)": (f"+{conf_bonus}" if mode.startswith("Breakout") else "N/A"),
-            "Downtrend penalties (Breakout)": (penalties if mode.startswith("Breakout") else "N/A"),
-            "Market regime bonus": f"+{mr_bonus}",
-            **regime_flags
-        })
+                st.subheader(f"{mode} — {ticker}")
+                st.metric("Growth Score (0–100)", final_score)
+                if final_score >= 70: st.success("✅ Strong Growth Profile")
+                elif final_score >= 50: st.info("🟡 Mixed / Watch")
+                else: st.warning("🔴 Weak / Avoid")
+                st.markdown("### Technicals Breakdown")
+                st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note}
+                                           for (n,v,s,w,note) in tech_rows]), use_container_width=True)
+                st.markdown("### Fundamentals Breakdown")
+                st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note}
+                                           for (n,v,s,w,note) in fund_rows]), use_container_width=True)
+                st.markdown("### Market")
+                st.json({"Market regime bonus": f"+{mr_bonus}", **regime_flags})
 
         with st.expander("Debug / raw features"):
             st.json({k:(float(v) if isinstance(v,(int,float,np.floating)) else (None if v is None else str(v)))
                      for k,v in feats.items()
-                     if k not in ["pct_to_200_hist","rsi_hist","volspike_hist","mom1_hist","mom3_hist","rs_3m_hist"]})
+                     if k not in ["pct_to_200_hist","rsi_hist","volspike_hist","mom1_hist","mom3_hist","rs_3m_hist","_close","_vol","_spy"]})
 
-        st.caption("Breakout mode: purely technical with confluence + explicit downtrend penalties. Growth mode: fundamentals weighted, tech capped.")
+        st.caption("Pre‑Breakout mode focuses on *setup quality*: tightness, dry‑up, pivot proximity, and RS leadership — to predict the move, not chase it.")
 
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
