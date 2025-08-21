@@ -7,7 +7,7 @@ st.set_page_config(page_title="Breakout AI", layout="centered")
 st.title("🚀 Breakout AI")
 st.caption("Switch between Breakout (trader) and Growth (fundamental) modes. Any ticker. Live data via yfinance.")
 
-# ---------- helpers ----------
+# ----------------- helpers -----------------
 def to_series_1d(x, index=None) -> pd.Series:
     if isinstance(x, pd.Series): return x
     if isinstance(x, pd.DataFrame): return x.iloc[:,0] if x.shape[1] else pd.Series(dtype=float)
@@ -42,34 +42,36 @@ def last_float(x) -> float:
         arr = np.asarray(x).reshape(-1); return float(arr[-1])
     except Exception: return float("nan")
 
-def zscore_to_score(current: float, hist: pd.Series, cap_sigma: float = 2.0) -> tuple[int,float]:
+def zscore_to_score(current: float, hist: pd.Series, cap_sigma: float = 2.0):
+    """Return (score 0..100, z). score = 50 + 25*z (clipped). Neutral=55 if missing."""
     h = to_series_1d(hist).dropna()
-    if not np.isfinite(current) or h.empty: return 55, float("nan")
+    if not np.isfinite(current) or h.empty: 
+        return 55, float("nan")
     mu, sd = float(h.mean()), float(h.std(ddof=0))
     if sd == 0: return 55, 0.0
-    z = (current-mu)/sd
+    z = (current - mu) / sd
     z = max(-cap_sigma, min(cap_sigma, z))
     score = int(round(max(0, min(100, 50 + 25*z))))
     return score, z
 
-def weighted(rows):
-    tw = sum(w for *_ , w, _ in rows)
-    if tw <= 0: return 0
-    return int(round(sum(s*w for *_, s, w, _ in rows)/tw))
-
-def softmax(scores, tau=10.0):
+def softmax(scores, tau=8.0):
     s = np.array(scores, dtype=float)
-    exps = np.exp((s-70.0)/max(tau,1e-6))
+    exps = np.exp((s - 70.0)/max(tau,1e-6))  # anchor around 70 so strong signals pop
     w = exps/np.sum(exps) if np.sum(exps)>0 else np.ones_like(s)/len(s)
     return w
 
-def softmax_aggregate(rows, tau=10.0):
-    scores = np.array([s for _,_,s,_,_ in rows], dtype=float)
+def softmax_aggregate(rows, tau=8.0):
+    scores = np.array([s for (_,_,s,_,_) in rows], dtype=float)
     if len(scores)==0: return 0
     w = softmax(scores, tau=tau)
     return int(round(np.sum(scores*w)))
 
-# ---------- data ----------
+def minmax_score(v, lo, hi, neutral=55):
+    if not np.isfinite(v): return neutral
+    x = (v - lo) / (hi - lo)
+    return int(round(100 * max(0, min(1, x))))
+
+# ----------------- data -----------------
 @st.cache_data(ttl=1800)
 def fetch_prices(ticker: str):
     df = yf.download(ticker, period="10y", interval="1d", auto_adjust=True, progress=False, threads=False)
@@ -91,7 +93,8 @@ def market_regime_bonus():
     try:
         spy, _ = fetch_prices("SPY")
         bull = last_float(spy) > last_float(spy.rolling(200).mean())
-    except Exception: bull = False
+    except Exception: 
+        bull = False
     vix = yf.download("^VIX", period="1y", interval="1d", progress=False, threads=False)
     vix_last = float(vix["Close"].iloc[-1]) if isinstance(vix,pd.DataFrame) and not vix.empty else float("nan")
     calm = (vix_last < 20) if np.isfinite(vix_last) else False
@@ -122,7 +125,7 @@ def compute_features(ticker: str):
     mom1_hist = c_hist.pct_change(21)*100.0
     mom3_hist = c_hist.pct_change(63)*100.0
 
-    # fundamentals (used only in Growth mode)
+    # fundamentals (for Growth mode)
     q_earn, q_fin = fetch_fundamentals(ticker)
     earnings_mom = rev_accel = gm_exp = float("nan")
     try:
@@ -144,7 +147,7 @@ def compute_features(ticker: str):
             if len(gm)>=2: gm_exp = float(gm.iloc[0]-gm.iloc[1])
     except Exception: pass
 
-    # relative strength vs SPY (3m) + its history
+    # relative strength vs SPY (3m) + history
     spy_close, _ = fetch_prices("SPY")
     rs_3m = float("nan"); rs_3m_hist = pd.Series(dtype=float)
     try:
@@ -162,38 +165,50 @@ def compute_features(ticker: str):
         earnings_mom=earnings_mom, rev_accel=rev_accel, gross_margin_exp=gm_exp
     )
 
-# ---------- scorers ----------
-def breakout_mode_scores(f):
-    """Pure breakout: heavy technicals similar to your early version."""
-    TECH_FLOOR = 45
-    # z‑score based subscores
-    s_pct200, z1 = zscore_to_score(f["pct_to_200"], f["pct_to_200_hist"]); s_pct200=max(TECH_FLOOR,s_pct200)
-    s_rsi,   z2 = zscore_to_score(f["rsi14"],    f["rsi_hist"]);           s_rsi=max(TECH_FLOOR,s_rsi)
-    s_vol,   z3 = zscore_to_score(f["vol_spike"],f["volspike_hist"]);      s_vol=max(TECH_FLOOR,s_vol)
-    s_m1, _  = zscore_to_score(f["mom_1m"],      f["mom1_hist"])
-    s_m3, _  = zscore_to_score(f["mom_3m"],      f["mom3_hist"])
+# ----------------- scoring blocks -----------------
+def breakout_scoring(f):
+    """Pure breakout: technicals only, strict downtrend penalties."""
+    TECH_FLOOR = 45  # floor weak subscores so one lagging factor can't nuke it
+
+    # z‑scores → subscores
+    s_pct200, z_pct200 = zscore_to_score(f["pct_to_200"], f["pct_to_200_hist"]); s_pct200=max(TECH_FLOOR,s_pct200)
+    s_rsi,   z_rsi    = zscore_to_score(f["rsi14"],      f["rsi_hist"]);         s_rsi=max(TECH_FLOOR,s_rsi)
+    s_vol,   z_vol    = zscore_to_score(f["vol_spike"],  f["volspike_hist"]);    s_vol=max(TECH_FLOOR,s_vol)
+    s_m1,_            = zscore_to_score(f["mom_1m"],     f["mom1_hist"])
+    s_m3,_            = zscore_to_score(f["mom_3m"],     f["mom3_hist"])
     s_mom = int(round((max(TECH_FLOOR,s_m1)+max(TECH_FLOOR,s_m3))/2))
-    s_rs,   z4 = zscore_to_score(f["rs_3m"],     f["rs_3m_hist"]);         s_rs=max(TECH_FLOOR,s_rs)
+    s_rs,   z_rs     = zscore_to_score(f["rs_3m"],       f["rs_3m_hist"]);       s_rs=max(TECH_FLOOR,s_rs)
 
     tech_rows = [
-        ("Pct vs 200‑DMA (z)", f"{f['pct_to_200']:.1f}%", s_pct200, 30, f"z={z1:.2f}σ"),
-        ("Volume/30d (z)",     f"{f['vol_spike']:.2f}×",   s_vol,    25, f"z={z3:.2f}σ"),
-        ("RSI(14) (z)",        f"{f['rsi14']:.1f}",       s_rsi,    20, f"z={z2:.2f}σ"),
-        ("Rel.Str. vs SPY (3m z)", f"{f['rs_3m']:.1f}%",  s_rs,     15, f"z={z4:.2f}σ"),
+        ("Pct vs 200‑DMA (z)", f"{f['pct_to_200']:.1f}%", s_pct200, 30, f"z={z_pct200:.2f}σ"),
+        ("Volume/30d (z)",     f"{f['vol_spike']:.2f}×",   s_vol,    25, f"z={z_vol:.2f}σ"),
+        ("RSI(14) (z)",        f"{f['rsi14']:.1f}",       s_rsi,    20, f"z={z_rsi:.2f}σ"),
+        ("Rel.Str. vs SPY (3m z)", f"{f['rs_3m']:.1f}%",  s_rs,     15, f"z={z_rs:.2f}σ"),
         ("Momentum (1m & 3m z)",   f"1m={f['mom_1m']:.1f}%, 3m={f['mom_3m']:.1f}%", s_mom, 10, "avg of z‑scores"),
     ]
-    # confluence
-    conf_hits = sum(1 for *_ , s, _, _ in [(r[0],r[1],r[2],r[3],r[4]) for r in tech_rows] if s>=70)
-    conf_bonus = 10 if conf_hits>=3 else 0
-    # aggregate technicals with softmax (emphasize winners)
-    tech_soft = softmax_aggregate(tech_rows, tau=8.0)
-    # no fundamentals in breakout mode
-    fund_rows, fund_avg = [], 0
-    return fund_rows, tech_rows, fund_avg, tech_soft, conf_bonus, conf_hits
 
-def growth_mode_scores(f):
-    """Growth/fundamental heavier mode (still technical‑led)."""
-    # technicals (lighter weights than breakout)
+    # Confluence (≥2 strong techs lights it up)
+    conf_hits = sum(1 for (_,_,s,_,_) in tech_rows if s>=70)
+    conf_bonus = 15 if conf_hits >= 2 else 0
+
+    # Downtrend penalties so weak names can't go green
+    penalties = 0
+    # below 200DMA → −20
+    if np.isfinite(f["pct_to_200"]) and f["pct_to_200"] < 0: penalties -= 20
+    # negative 3m RS → −10
+    if np.isfinite(f["rs_3m"]) and f["rs_3m"] < 0: penalties -= 10
+    # negative 1m momentum → −10
+    if np.isfinite(f["mom_1m"]) and f["mom_1m"] < 0: penalties -= 10
+
+    # Aggregate technicals (purely) via softmax
+    tech_soft = softmax_aggregate(tech_rows, tau=6.0)
+    base = int(round(tech_soft + penalties))
+
+    return [], tech_rows, 0, tech_soft, conf_bonus, conf_hits, penalties
+
+def growth_scoring(f):
+    """Growth/fundamental mode: fundamentals heavy, technicals capped."""
+    # Technicals (z-scores)
     s_pct200,_ = zscore_to_score(f["pct_to_200"], f["pct_to_200_hist"])
     s_rsi,_    = zscore_to_score(f["rsi14"],      f["rsi_hist"])
     s_vol,_    = zscore_to_score(f["vol_spike"],  f["volspike_hist"])
@@ -209,41 +224,41 @@ def growth_mode_scores(f):
         ("Rel.Str. vs SPY (3m z)", f"{f['rs_3m']:.1f}%",  s_rs,     10, ""),
         ("Momentum (1m & 3m z)",   f"1m={f['mom_1m']:.1f}%, 3m={f['mom_3m']:.1f}%", s_mom, 10, ""),
     ]
-    tech_soft = softmax_aggregate(tech_rows, tau=10.0)
+    tech_soft = min(70, softmax_aggregate(tech_rows, tau=10.0))  # cap tech influence in Growth
 
-    # fundamentals (light)
-    def mm(v, lo, hi):
-        if not np.isfinite(v): return 55
-        x = (v-lo)/(hi-lo)
-        return int(round(100*max(0,min(1,x))))
-    s_em = mm(f.get("earnings_mom",np.nan), -20, 50)
-    s_ra = mm(f.get("rev_accel",np.nan),     -15, 25)
-    s_gm = mm(f.get("gross_margin_exp",np.nan), -8, 15)
+    # Fundamentals (min‑max)
+    s_em = minmax_score(f.get("earnings_mom",np.nan), -20, 50)
+    s_ra = minmax_score(f.get("rev_accel",np.nan),     -15, 25)
+    s_gm = minmax_score(f.get("gross_margin_exp",np.nan), -8, 15)
     fund_rows = [
         ("Earnings Momentum (YoY revenue)", f.get("earnings_mom","N/A"), s_em, 10, "−20…+50% mapped"),
         ("Revenue Acceleration (pp)",       f.get("rev_accel","N/A"),     s_ra,  5, "−15…+25 pp"),
         ("Gross Margin Expansion (pp)",     f.get("gross_margin_exp","N/A"), s_gm, 5, "−8…+15 pp"),
     ]
-    fund_avg = weighted(fund_rows)
-    return fund_rows, tech_rows, fund_avg, tech_soft, 0, 0
+    # Weighted avg fundamentals (heavier)
+    fw = sum(w for *_ , w, _ in fund_rows)
+    fund_avg = int(round(sum(s*w for (_,_,s,w,_) in fund_rows)/fw)) if fw>0 else 0
 
-# ---------- UI ----------
+    # Heavy weight to fundamentals
+    base = int(round(0.70 * fund_avg + 0.30 * tech_soft))
+    return fund_rows, tech_rows, fund_avg, tech_soft, 0, 0, 0
+
+# ----------------- UI -----------------
 mode = st.radio("Mode", ["Breakout (trader)","Growth (fundamental)"], horizontal=True)
-ticker = st.text_input("Ticker", value="ASTS").strip().upper()
+ticker = st.text_input("Ticker", value="TSLA").strip().upper()
 
 if st.button("Run Screener"):
     try:
         with st.spinner("Fetching & scoring…"):
             feats = compute_features(ticker)
             if mode.startswith("Breakout"):
-                fund_rows, tech_rows, fund_avg, tech_soft, conf_bonus, conf_hits = breakout_mode_scores(feats)
-                base = int(round(0.95*tech_soft + 0.05*fund_avg))  # almost pure technical
+                fund_rows, tech_rows, fund_avg, tech_soft, conf_bonus, conf_hits, penalties = breakout_scoring(feats)
+                mr_bonus, regime_flags = market_regime_bonus()
+                final_score = int(min(100, max(0, tech_soft + conf_bonus + penalties + mr_bonus)))
             else:
-                fund_rows, tech_rows, fund_avg, tech_soft, conf_bonus, conf_hits = growth_mode_scores(feats)
-                base = int(round(0.80*tech_soft + 0.20*fund_avg))
-
-            mr_bonus, regime_flags = market_regime_bonus()
-            final_score = int(min(100, max(0, base + conf_bonus + mr_bonus)))
+                fund_rows, tech_rows, fund_avg, tech_soft, conf_bonus, conf_hits, penalties = growth_scoring(feats)
+                mr_bonus, regime_flags = market_regime_bonus()
+                final_score = int(min(100, max(0, int(round(0.70*fund_avg + 0.30*tech_soft)) + mr_bonus)))
 
         st.subheader(f"{mode} — {ticker}")
         st.metric("Breakout Score (0–100)", final_score)
@@ -265,9 +280,10 @@ if st.button("Run Screener"):
         else:
             st.write("_(Not used in Breakout mode)_")
 
-        st.markdown("### Bonuses")
+        st.markdown("### Bonuses / Penalties")
         st.json({
-            "Confluence bonus": f"+{conf_bonus} (tech factors ≥70: {conf_hits})",
+            "Confluence bonus (Breakout)": (f"+{conf_bonus}" if mode.startswith("Breakout") else "N/A"),
+            "Downtrend penalties (Breakout)": (penalties if mode.startswith("Breakout") else "N/A"),
             "Market regime bonus": f"+{mr_bonus}",
             **regime_flags
         })
@@ -277,7 +293,7 @@ if st.button("Run Screener"):
                      for k,v in feats.items()
                      if k not in ["pct_to_200_hist","rsi_hist","volspike_hist","mom1_hist","mom3_hist","rs_3m_hist"]})
 
-        st.caption("Breakout mode: 200‑DMA, volume, RSI, relative strength, momentum (softmax + confluence). Growth mode adds lighter fundamentals.")
+        st.caption("Breakout mode: purely technical with confluence + explicit downtrend penalties. Growth mode: fundamentals weighted, tech capped.")
 
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
