@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from typing import Optional
 
 st.set_page_config(page_title="Breakout AI", layout="centered")
 st.title("🚀 Breakout AI")
@@ -70,6 +71,26 @@ def minmax_score(v, lo, hi, neutral=55):
     if not np.isfinite(v): return neutral
     x = (v - lo) / (hi - lo)
     return int(round(100 * max(0, min(1, x))))
+
+# ---- Score badge helpers (UI) ----
+def _score_color(score: Optional[int]) -> str:
+    if score is None: return "gray"
+    if score >= 70:   return "green"
+    if score >= 40:   return "orange"
+    return "red"
+
+def show_badge(label: str, score: Optional[int] = None, *, color: Optional[str] = None, note: str = ""):
+    c = color or _score_color(score)
+    text = f"{label}" if score is None else f"{label}: {score}"
+    if note:
+        text += f" — {note}"
+    bg = 'rgba(128,128,128,0.12)' if c=='gray' else 'rgba(0,0,0,0.05)'
+    html = f"""
+    <div style="display:inline-block;padding:6px 10px;border-radius:8px;margin:2px 6px 10px 0;background:{bg};">
+        <span style="font-weight:600;color:{c};">{text}</span>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
 # ----------------- data -----------------
 @st.cache_data(ttl=1800)
@@ -336,13 +357,31 @@ if st.button("Run Screener"):
             mr_bonus, regime_flags = market_regime_bonus()
 
             if mode.startswith("Pre‑Breakout"):
+                # Compute pre‑breakout score
                 pred_rows, pred_score, status, extra = prebreakout_scoring(ticker, feats)
-                final_score = int(min(100, max(0, pred_score + mr_bonus)))
+                pre_final = int(min(100, max(0, pred_score + mr_bonus)))
+
+                # ALSO compute breakout score (for the "Expired" check)
+                _fr, _tr, _favg, _tsoft, _conf_b, _hits, _pen = breakout_scoring(feats)
+                breakout_final_for_check = int(min(100, max(0, _tsoft + _conf_b + _pen + mr_bonus)))
+
                 st.subheader(f"{mode} — {ticker}")
-                st.metric("Pre‑Breakout Setup Score (0–100)", final_score)
-                if final_score >= 70: st.success(f"✅ {status}")
-                elif final_score >= 50: st.info(f"🟡 {status}")
+
+                # ---- Color badges (with Expired behavior) ----
+                # Breakout badge (for context)
+                show_badge("Breakout Score", breakout_final_for_check)
+
+                # Pre‑Breakout: gray if already broken out
+                if breakout_final_for_check >= 80:
+                    show_badge("Pre‑Breakout", None, color="gray", note="Expired (already broken out)")
+                else:
+                    show_badge("Pre‑Breakout Score", pre_final)
+
+                # Table + details
+                if pre_final >= 70: st.success(f"✅ {status}")
+                elif pre_final >= 50: st.info(f"🟡 {status}")
                 else: st.warning(f"🔴 {status}")
+
                 st.markdown("### Predictive Breakdown")
                 st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note}
                                            for (n,v,s,w,note) in pred_rows]), use_container_width=True)
@@ -352,14 +391,17 @@ if st.button("Run Screener"):
             elif mode.startswith("Breakout"):
                 fund_rows, tech_rows, fund_avg, tech_soft, conf_bonus, conf_hits, penalties = breakout_scoring(feats)
                 final_score = int(min(100, max(0, tech_soft + conf_bonus + penalties + mr_bonus)))
+
                 st.subheader(f"{mode} — {ticker}")
-                st.metric("Breakout Score (0–100)", final_score)
-                if final_score >= 70: st.success("🔥 Strong Breakout Setup")
-                elif final_score >= 50: st.info("🟡 Constructive / Watchlist")
-                else: st.warning("🔴 Weak / Avoid")
+
+                # ---- Color badge for Breakout ----
+                show_badge("Breakout Score", final_score)
+
+                # Breakdown tables
                 st.markdown("### Technicals Breakdown")
                 st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note}
                                            for (n,v,s,w,note) in tech_rows]), use_container_width=True)
+
                 st.markdown("### Bonuses / Penalties")
                 st.json({
                     "Confluence bonus": f"+{conf_bonus} (tech factors ≥70: {conf_hits})",
@@ -368,14 +410,21 @@ if st.button("Run Screener"):
                     **regime_flags
                 })
 
+                # Status tags (keep your wording)
+                if final_score >= 70: st.success("🔥 Strong Breakout Setup")
+                elif final_score >= 50: st.info("🟡 Constructive / Watchlist")
+                else: st.warning("🔴 Weak / Avoid")
+
             else:  # Growth
                 fund_rows, tech_rows, fund_avg, tech_soft, _, _, _ = growth_scoring(feats)
                 final_score = int(min(100, max(0, int(round(0.70*fund_avg + 0.30*tech_soft)) + mr_bonus)))
+
                 st.subheader(f"{mode} — {ticker}")
-                st.metric("Growth Score (0–100)", final_score)
-                if final_score >= 70: st.success("✅ Strong Growth Profile")
-                elif final_score >= 50: st.info("🟡 Mixed / Watch")
-                else: st.warning("🔴 Weak / Avoid")
+
+                # ---- Color badge for Growth ----
+                show_badge("Growth Score", final_score)
+
+                # Tables
                 st.markdown("### Technicals Breakdown")
                 st.dataframe(pd.DataFrame([{"Factor":n,"Value":v,"Subscore (0‑100)":s,"Weight":w,"Notes":note}
                                            for (n,v,s,w,note) in tech_rows]), use_container_width=True)
